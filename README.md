@@ -13,3 +13,5 @@
 yarn install
 yarn start
 ```
+
+When the program is first run it will initialise the sqlite db and insert the last 6 hours of mango instructions and oracle price updates. Subsequent runs will insert all new transactions (since the previous run).
