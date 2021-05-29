@@ -212,7 +212,7 @@ function processMangoTransaction(confirmedTransaction, signature) {
     select
     t1.signature,
     t1.symbol,
-    min(t2.slot) as min_slot
+    max(t2.slot) as min_slot
     from vault_flows t1
     left join oracle_transactions t2
     on t1.symbol = t2.symbol
