@@ -1,0 +1,22 @@
+{
+    "name": "mango-instruction-stats",
+    "version": "1.0.0",
+    "description": "",
+    "main": "index.js",
+    "scripts": {
+      "start": "ts-node src/index.ts",
+      "test": "echo \"Error: no test specified\" && exit 1"
+    },
+    "repository": "https://github.com/nicholasgodfreyclarke/mango-instruction-stats",
+    "author": "Nicholas Clarke",
+    "license": "MIT",
+    "homepage": "https://github.com/nicholasgodfreyclarke/mango-instruction-stats#readme",
+    "dependencies": {
+      "@blockworks-foundation/mango-client": "^0.1.11",
+      "@solana/web3.js": "^1.2.7",
+      "axios": "^0.21.1",
+      "better-sqlite3": "^7.1.4",
+      "package.json": "^2.0.1"
+    }
+  }
+  
