@@ -1,259 +1,20 @@
-import path from 'path';
-import Database, { Statement } from 'better-sqlite3';
-import fs from 'fs';
 import { Connection, PublicKey, ConfirmedTransaction, Transaction, ConfirmedSignatureInfo } from '@solana/web3.js';
 import { MangoInstructionLayout, sleep, IDS, MangoClient} from '@blockworks-foundation/mango-client';
 const schema_1 = require("@blockworks-foundation/mango-client/lib/schema.js");
 
-var db; 
-var vaultSymbolMap;
-var oracleSymbolMap;
-var mangoGroupSymbolMap;
-var symbolMintDecimalsMap;
-const requestWaitTime = 500;
+import {createReverseIdsMap} from './maps';
 
-const oracleProgramId = 'FjJ5mhdRWeuaaremiHjeQextaAw1sKWDqr3D7pXjgztv';
-const mangoProgramId = 'JD3bq9hGdy38PuWQ4h2YJpELmHVGPPfFSuFkpzAd9zfu';
+import { insertNewSignatures } from './signatures';
 
-async function getNewSignatures(afterSignature: string, connection: Connection, account: PublicKey) {
-    // Fetches all signatures associated with the account - working backwards in time until it encounters the "afterSignature" signature
+import { Pool } from 'pg'
 
-    let signatures;
-    const limit = 1000;
-    let before = null;
-    let options;
-    let allSignaturesInfo: ConfirmedSignatureInfo[] = [];
-    while (true) {
+const pgp = require('pg-promise')({
+    capSQL: true
+ });
 
-        if (before === null) {
-            options = {limit: limit};
-        } else {
-            options = {limit: limit, before: before};
-        }
-        
-        let signaturesInfo = (await connection.getConfirmedSignaturesForAddress2(account, options));
-        signatures = signaturesInfo.map(x => x['signature']);
+var reverseIds;
 
-        let latestDbSignatureIndex = signatures.indexOf(afterSignature);
-
-        if (latestDbSignatureIndex !== -1) {
-            allSignaturesInfo = allSignaturesInfo.concat(signaturesInfo.slice(0, latestDbSignatureIndex));
-            break
-        } else {
-            allSignaturesInfo = allSignaturesInfo.concat(signaturesInfo);
-            
-        }
-        before = signatures[signatures.length-1];
-
-        console.log(new Date(signaturesInfo[signaturesInfo.length-1].blockTime! * 1000).toISOString());
-
-        await sleep(requestWaitTime);
-    }
-
-    return allSignaturesInfo
-}
-
-
-async function getLatestSignatureBeforeUnixEpoch(connection, account, unixEpoch) {
-
-    let signaturesInfo;  
-    let limit = 1000;
-    let options;
-    let earliestSignature = null;
-    let signature;
-    let found = false;
-    while (true) {
-      
-        if (earliestSignature === null) {
-            options = {limit: limit};
-        } else {
-            options = {limit: limit, before: earliestSignature};
-        }
-        
-        signaturesInfo = await connection.getConfirmedSignaturesForAddress2(account, options);
-
-        for (let signatureInfo of signaturesInfo) {
-            if (signatureInfo.blockTime < unixEpoch) {
-                signature = signatureInfo.signature;
-                found = true;
-                break
-            }
-        }
-        if (found) {break}
-
-        earliestSignature = signaturesInfo[signaturesInfo.length - 1].signature;
-
-        console.log(new Date(signaturesInfo[signaturesInfo.length-1].blockTime! * 1000).toISOString());
-
-        await sleep(requestWaitTime);
-    }
-
-    return signature;
-}
-
-
-async function insertNewSignatures(account, connection) {
-    let latestDbSignatureRow = db.prepare('select signature from transactions where id = (select max(id) from transactions where account = ?)').get(account.toBase58());
-
-    let latestDbSignature;
-    if (!latestDbSignatureRow) {
-
-        let currentUnixEpoch = Math.round(Date.now()/1000);
-        // If tranasctions table is empty - initialise by getting all signatures in the 6 hours
-        let latestSignatureUnixEpoch = currentUnixEpoch - 6 * 60 * 60;
-
-        console.log('Current time ', new Date(currentUnixEpoch * 1000).toISOString());
-        console.log('Getting all signatures after ', new Date(latestSignatureUnixEpoch * 1000).toISOString());
-        
-        latestDbSignature = await getLatestSignatureBeforeUnixEpoch(connection, account, latestSignatureUnixEpoch);
-    } else {
-        latestDbSignature = latestDbSignatureRow['signature'];
-    }
-
-    let newSignatures = await getNewSignatures(latestDbSignature, connection, account);
-
-    // By default the signatures returned by getConfirmedSignaturesForAddress2 will be ordered newest -> oldest
-    // We reverse the order to oldest -> newest here
-    // This is useful for our purposes as by inserting oldest -> newest if inserts are interrupted for some reason the process can pick up where it left off seamlessly (with no gaps)
-    // Also ensures that the auto increment id in our table is incremented oldest -> newest
-    newSignatures = newSignatures.reverse();
-    db.transaction(signaturesInfo => {
-        const insert = db.prepare("INSERT INTO transactions (signature, account, block_time, block_datetime, slot, err, process_state) values (?, ?, ?,  datetime(?, 'unixepoch'), ?, ?, ?)");
-        for (const signatureInfo of signaturesInfo) {
-            insert.run(
-                signatureInfo.signature,
-                account.toBase58(),
-                signatureInfo.blockTime,
-                signatureInfo.blockTime,
-                signatureInfo.slot,
-                signatureInfo.err === null ? 0 : 1,
-                'unprocessed'
-                );
-            }
-    })(newSignatures);
-
-    console.log('inserted ' + newSignatures.length + ' signatures')
-}
-
-
-function updateTransactionSummary(confirmedTransaction, signature) {
-    let maxCompute = 0;
-    for (let logMessage of confirmedTransaction.meta!.logMessages!) {
-        
-        if (logMessage.endsWith('compute units')) {
-            let re = new RegExp(/(\d+)\sof/);
-            let matches = re.exec(logMessage);
-            if (matches) {
-                let compute = parseInt(matches[1]);
-                if (compute > maxCompute) {
-                    maxCompute = compute;
-                }
-            }
-        }
-    }
-
-    let logMessages = confirmedTransaction.meta!.logMessages!.join('\n');
-
-    db.prepare("update transactions set log_messages = ?, compute = ? where signature = ?").run(
-        logMessages, maxCompute, signature);
-}
-
-
-function toNumber(data, decimals) {
-    return data.toNumber() / Math.pow(10, decimals)
-}
-
-
-function processOracleTransaction(confirmedTransaction, signature) {
-    let oraclePk = confirmedTransaction.transaction.keys[1].toString()
-    let slot = confirmedTransaction.slot;
-
-    let instruction = schema_1.Instruction.deserialize(confirmedTransaction!.transaction.instructions[0].data);
-    
-    let roundId = instruction.Submit.round_id.toNumber();
-    let value = toNumber(instruction.Submit.value, 2)
-    let symbol = oracleSymbolMap[oraclePk];
-
-    db.prepare("insert into oracle_transactions (signature, slot, oracle_pk, round_id, value, symbol) values (?, ?, ?, ?, ?, ?)").run(
-        signature, slot, oraclePk, roundId, value, symbol);
-}
-
-function insertDepositWithdraws(depositWithdrawInserts, signature) {
-    const insertDepositWithdrawSmt = db.prepare('INSERT INTO deposit_withdraw (signature, instruction_num, slot, owner, side, quantity, symbol) VALUES (?, ?, ?, ?, ?, ?, ?)');
-    // This query get the latest price for each symbol in a signature
-    const selectUsdEquivalentSmt = db.prepare(`
-    with latest_slot as
-    (
-    select
-    t1.signature,
-    t1.symbol,
-    max(t2.slot) as min_slot
-    from deposit_withdraw t1
-    left join oracle_transactions t2
-    on t1.symbol = t2.symbol
-    and t1.slot >= t2.slot
-    group by t1.signature, t1.symbol
-    )
-    select t1.signature,
-    t1.symbol,
-    case 
-    when t1.symbol = 'USDT' then 1 
-    else t3.value
-    end as symbol_price,
-    case 
-    when t1.symbol = 'USDT' then 1 
-    else t3.value
-    end * t1.quantity as usd_equivalent
-    from deposit_withdraw t1
-    inner join latest_slot t2
-    on t2.signature = t1.signature
-    left join oracle_transactions t3
-    on t3.symbol = t2.symbol
-    and t3.slot = t2.min_slot
-    where t1.signature = ?
-    `);
-    // Can have multiple symbols per signature here but they will all have the same slot
-    const updateDepositWithdrawSmt = db.prepare('update deposit_withdraw set symbol_price = ?, usd_equivalent = ? where signature = ? and symbol = ?')
-    
-    // There can be multiple deposits/withdraws in a Mango transaction
-    // Insert them in a SQL transaction so that if one fails they all fail - otherwise could have process_state = error with some inserts completed (causing duplicates if signature re-processed)
-    const insertDepositWithdrawTrans = db.transaction((depositWithdrawInserts) => {
-        for (const depositWithdrawInsert of depositWithdrawInserts) insertDepositWithdrawSmt.run(depositWithdrawInsert);
-
-        let updates = selectUsdEquivalentSmt.all(signature);
-
-        for (const update of updates) updateDepositWithdrawSmt.run(update['symbol_price'], update['usd_equivalent'], update['signature'], update['symbol'])
-
-    });
-    insertDepositWithdrawTrans(depositWithdrawInserts);
-}
-
-function liquidationInserts(insertLiquidationsValues, insertLiquidationHoldingsValues) {
-    const insertLiquidationSmt = db.prepare(`
-    insert into liquidations 
-    (signature, liqor, liquee, coll_ratio, in_token_symbol, in_token_amount, in_token_price, out_token_symbol, out_token_amount, out_token_price) 
-    values 
-    (@signature, @liqor, @liquee, @coll_ratio, @in_token_symbol, @in_token_amount, @in_token_price, @out_token_symbol, @out_token_amount, @out_token_price)`)
-
-    const insertLiquidationHoldingsSmt = db.prepare(`
-    insert into liquidation_holdings
-    (signature, symbol, assets, liabs, price) 
-    values 
-    (@signature, @symbol, @assets, @liabs, @price)`)
-
-    const insertLiquidationsTrans = db.transaction((insertLiquidationsValues, insertLiquidationHoldingsValues) => {
-        insertLiquidationSmt.run(insertLiquidationsValues);
-
-        for (const liquidationHoldings of insertLiquidationHoldingsValues) {
-            insertLiquidationHoldingsSmt.run(liquidationHoldings)
-        }
-    });
-
-    insertLiquidationsTrans(insertLiquidationsValues, insertLiquidationHoldingsValues)
-
-}
-
-function ParseLiquidation(instruction, confirmedTransaction, signature) {
+function ParseLiquidationData(instruction, confirmedTransaction) {
     let accounts = instruction.keys.map(e => e.pubkey.toBase58())
     let mangoGroup, liqor, liqorInTokenWallet, liqorOutTokenWallet, liqeeMarginAccount, inTokenVault, outTokenVault, signerKey;
     [mangoGroup, liqor, liqorInTokenWallet, liqorOutTokenWallet, liqeeMarginAccount, inTokenVault, outTokenVault, signerKey] = accounts.slice(0, 8);
@@ -268,294 +29,480 @@ function ParseLiquidation(instruction, confirmedTransaction, signature) {
     let outPreOutTokenBalances = transactionMeta.preTokenBalances.find(e => e.accountIndex === liqorOutTokenWalletIndex);
     let outPostOutTokenBalances = transactionMeta.postTokenBalances.find(e => e.accountIndex === liqorOutTokenWalletIndex);
     
-    // TODO: remove (testing)
-    let inTokenSymbol = vaultSymbolMap[mangoGroup][inTokenVault];
-    let outTokenSymbol = vaultSymbolMap[mangoGroup][outTokenVault];
-    // let inTokenSymbol = 'BTC';
-    // let outTokenSymbol = 'USDT';
+    let inTokenSymbol = reverseIds.vault_symbol[inTokenVault];
+    let outTokenSymbol = reverseIds.vault_symbol[outTokenVault];
 
-    let inTokenAmount =  inPostInTokenBalances.uiTokenAmount.uiAmount - inPreTokenBalances.uiTokenAmount.uiAmount;
+    let inTokenAmount =  (inPostInTokenBalances.uiTokenAmount.uiAmount - inPreTokenBalances.uiTokenAmount.uiAmount) * -1;
     let outTokenAmount = outPostOutTokenBalances.uiTokenAmount.uiAmount - outPreOutTokenBalances.uiTokenAmount.uiAmount;
 
-    let assets;
-    let liabs;
-    let collRatio;
-    let prices;
     let symbols;
+    let startAssets;
+    let startLiabs;
+    let endAssets;
+    let endLiabs;
+    let socializedLoss;
+    let totalDeposits;
+    let prices;
+    let socializedLossPercentages: number[] = [];
+    let startAssetsVal = 0;
+    let startLiabsVal = 0;
     for (let logMessage of confirmedTransaction.meta.logMessages) {
-        if (logMessage.startsWith('Program log: Liquidation details: ')) {
-            let liquidationDetails = JSON.parse(logMessage.slice('Program log: Liquidation details: '.length));
+        if (logMessage.startsWith('Program log: liquidation details: ')) {
+            let liquidationDetails = JSON.parse(logMessage.slice('Program log: liquidation details: '.length));
             
 
-            assets = liquidationDetails.assets;
-            liabs = liquidationDetails.liabs;
-            collRatio = liquidationDetails.coll_ratio;
             prices = liquidationDetails.prices;
+            startAssets = liquidationDetails.start.assets;
+            startLiabs = liquidationDetails.start.liabs;
+            endAssets = liquidationDetails.end.assets;
+            endLiabs = liquidationDetails.end.liabs;
+            socializedLoss = liquidationDetails.socialized_losses;
+            totalDeposits = liquidationDetails.total_deposits;
 
-            // TODO: remove
-            // let mangoGroup = '7pVYhpKUHw88neQHxgExSH6cerMZ1Axx1ALQP9sxtvQV'
-
-            symbols = mangoGroupSymbolMap[mangoGroup]
-
-            let quoteDecimals = symbolMintDecimalsMap[mangoGroup][symbols[symbols.length - 1]]
-            for (let i = 0; i < assets.length; i++) { 
+            symbols = reverseIds.mango_groups[mangoGroup].symbols
+            // symbols = mangoGroupSymbolMap[mangoGroup]
+            let quoteDecimals = reverseIds.mango_groups[mangoGroup].mint_decimals[symbols[symbols.length - 1]]
+            for (let i = 0; i < startAssets.length; i++) { 
                 let symbol = symbols[i]
-                let mintDecimals = symbolMintDecimalsMap[mangoGroup][symbol]
+                let mintDecimals = reverseIds.mango_groups[mangoGroup].mint_decimals[symbol]
 
                 prices[i] = prices[i] * Math.pow(10, mintDecimals - quoteDecimals)
-                assets[i] = assets[i] / Math.pow(10, mintDecimals)
-                liabs[i] = liabs[i] / Math.pow(10, mintDecimals)
+                startAssets[i] = startAssets[i] / Math.pow(10, mintDecimals)
+                startLiabs[i] = startLiabs[i] / Math.pow(10, mintDecimals)
+                endAssets[i] = endAssets[i] / Math.pow(10, mintDecimals)
+                endLiabs[i] = endLiabs[i] / Math.pow(10, mintDecimals)
+                totalDeposits[i] = totalDeposits[i] / Math.pow(10, mintDecimals)
+
+                socializedLossPercentages.push(endLiabs[i] / totalDeposits[i])
+                startAssetsVal += startAssets[i] * prices[i];
+                startLiabsVal += startLiabs[i] * prices[i];
             }
             
             break;
         }
     }
 
+    let collRatio = startAssetsVal / startLiabsVal;
     let inTokenPrice = prices[symbols.indexOf(inTokenSymbol)];
     let outTokenPrice = prices[symbols.indexOf(outTokenSymbol)];
 
-    let insertLiquidationsValues = {
-        signature: signature,
+    let inTokenUsd = inTokenAmount * inTokenPrice;
+    let outTokenUsd = outTokenAmount * outTokenPrice;
+    let liquidationFeeUsd = outTokenUsd - inTokenUsd;
+
+    let liquidation = {
+        mango_group: mangoGroup,
         liqor: liqor,
-        liquee: liqeeMarginAccount,
-        coll_ratio: collRatio, 
+        liqee: liqeeMarginAccount,
+        coll_ratio: collRatio,
         in_token_symbol: inTokenSymbol,
         in_token_amount: inTokenAmount,
         in_token_price: inTokenPrice,
+        in_token_usd: inTokenUsd,
         out_token_symbol: outTokenSymbol,
         out_token_amount: outTokenAmount,
-        out_token_price: outTokenPrice
+        out_token_price: outTokenPrice,
+        out_token_usd: outTokenUsd,
+        liquidation_fee_usd: liquidationFeeUsd,
+        socialized_losses: socializedLoss,
     }
 
-    let insertLiquidationHoldingsValues: any[] = [];
-    for (let i= 0; i < assets.length; i++) {
-        insertLiquidationHoldingsValues.push({
-            signature: signature,
-            symbol: symbols[i],
-            assets: assets[i],
-            liabs: liabs[i],
-            price: prices[i]
-        })
+    let liquidationHoldings: any = [];
+    for (let i= 0; i < startAssets.length; i++) {
+        if ((startAssets[i] > 0) || (startLiabs[i] > 0)) {
+            liquidationHoldings.push({
+                symbol: symbols[i],
+                start_assets: startAssets[i],
+                start_liabs: startLiabs[i],
+                end_assets: endAssets[i],
+                end_liabs: endLiabs[i],
+                price: prices[i]
+            })
+        }
     }
 
-    liquidationInserts(insertLiquidationsValues, insertLiquidationHoldingsValues);
+    
+    let socializedLosses: any[] = [];
+    if (socializedLoss) {
+        for (let i= 0; i < totalDeposits.length; i++) {
+            if (endLiabs[i] > 0) {
+                socializedLoss.push({
+                    symbol: symbols[i],
+                    symbol_price: prices[i],
+                    loss: endLiabs[i],
+                    total_deposits: totalDeposits[i],
+                    loss_percentage: socializedLossPercentages[i],
+                    loss_usd: endLiabs[i] * prices[i],
+                    total_deposits_usd: totalDeposits[i] * prices[i]
+                })
+            }
+        }
+    }
+
+    return [liquidation, liquidationHoldings, socializedLosses]
 }
 
-function processMangoTransaction(confirmedTransaction, signature) {
+
+
+
+function parseOracleData(confirmedTransaction) {
+    let oraclePk = confirmedTransaction.transaction.keys[1].toString()
     let slot = confirmedTransaction.slot;
-    let instructions = confirmedTransaction.transaction.instructions;
 
-    // TODO: flow is not a great name - want name that covers withdrawals and deposits though
+    let instruction = schema_1.Instruction.deserialize(confirmedTransaction!.transaction.instructions[0].data);
+    
+    let roundId = instruction.Submit.round_id.toNumber();
+    let submitValue = instruction.Submit.value.toNumber()
+    let decimals = reverseIds.oracle_decimals[oraclePk]
+    let value = submitValue / Math.pow(10, decimals)
+    let symbol = reverseIds.oracle_symbol[oraclePk];
+
+    return {slot: slot, oracle_pk: oraclePk, round_id: roundId, value: value, symbol: symbol, submit_value: submitValue}
+}
+
+
+function parseDepositWithdrawData(instruction) {
+    let decodedInstruction = MangoInstructionLayout.decode(instruction.data);
+    let instructionName = Object.keys(decodedInstruction)[0];
+
+    let mangoGroup = instruction.keys[0].pubkey.toBase58()
+    let marginAccount = instruction.keys[1].pubkey.toBase58()
+    let owner = instruction.keys[2].pubkey.toBase58()
+    let vault = instruction.keys[4].pubkey.toBase58()
+    let symbol = reverseIds.vault_symbol[vault]
+    let mintDecimals = reverseIds.mango_groups[mangoGroup].mint_decimals[symbol]
+    let quantity = decodedInstruction[instructionName].quantity.toNumber() / Math.pow(10, mintDecimals)
+
+    return {mango_group: mangoGroup, owner: owner, quantity: quantity, symbol: symbol, side: instructionName, margin_account: marginAccount}
+
+}
+
+function parseMangoTransactions(transactions) {
+    let processStates: any[] = [];
+    let transactionSummaries: any[] = [];
+
     let depositWithdrawInserts: any[] = [];
-    // Can have multiple inserts per signature so add instructionNum column to allow a primary key
-    let instructionNum = 1;
-    for (let instruction of instructions) {
-        let decodedInstruction = MangoInstructionLayout.decode(instruction.data);
-        let instructionName = Object.keys(decodedInstruction)[0];
+    let liquidationInserts: any[] = [];
+    let liquidationHoldingsInserts: any[] = [];
+    let socializedLossInserts: any[] = [];
 
-        if ((instructionName === 'Deposit') || (instructionName === 'Withdraw')) {
-            // Luckily Deposit and Withdraw have the same layout
+    let counter = 1;
+    for (let transaction of transactions) {
+        let [signature, confirmedTransaction] = transaction;
+        try {
+            let transactionSummary = parseTransactionSummary(confirmedTransaction)
+            transactionSummary['signature'] = signature
+            transactionSummaries.push(transactionSummary)
 
-            let mangoGroup = instruction.keys[0].pubkey.toBase58()
-            let owner = instruction.keys[2].pubkey.toBase58()
-            let vault = instruction.keys[4].pubkey.toBase58()
-            let symbol = vaultSymbolMap[mangoGroup][vault]
-            let mintDecimals = symbolMintDecimalsMap[mangoGroup][symbol]
-            let quantity = toNumber(decodedInstruction[instructionName].quantity, mintDecimals)
-            
-            depositWithdrawInserts.push([signature, instructionNum, slot, owner, instructionName, quantity, symbol])
-        } else if (instructionName === 'PartialLiquidate') {
-            ParseLiquidation(instruction, confirmedTransaction, signature)
+            if (confirmedTransaction.meta.err !== null) {
+                processStates.push({signature: signature, process_state: 'transaction error'});
+            } else {
+                let slot = confirmedTransaction.slot;
+                let instructions = confirmedTransaction.transaction.instructions;
+
+                // Can have multiple inserts per signature so add instructionNum column to allow a primary key
+                let instructionNum = 1;
+                for (let instruction of instructions) {
+                    
+                    let decodedInstruction
+                    try {
+                        decodedInstruction = MangoInstructionLayout.decode(instruction.data);
+                    } catch(e) {
+                        // TODO: think about a better way of handling the situation where I try to decode a non mango instruction and get an error
+                        // If I fail to parse a legitimate mango instruction then this will fail silently
+                        console.log(e)
+                    }
+                        
+                    if (decodedInstruction) {
+                        let instructionName = Object.keys(decodedInstruction)[0];
+
+                        if ((instructionName === 'Deposit') || (instructionName === 'Withdraw')) {
+                            // Luckily Deposit and Withdraw have the same layout
+    
+                            let depositWithdrawData = parseDepositWithdrawData(instruction)
+                            depositWithdrawData['signature'] = signature
+                            depositWithdrawData['slot'] = slot
+                            depositWithdrawData['instruction_num'] = instructionNum
+                            
+                            depositWithdrawInserts.push(depositWithdrawData);                        
+    
+                        } else if (instructionName === 'PartialLiquidate') {
+                            let [liquidation, liquidationHoldings, socializedLosses] = ParseLiquidationData(instruction, confirmedTransaction)
+                            liquidation['signature'] = signature
+    
+                            liquidationInserts.push(liquidation)
+    
+                            for (let liquidationHolding of liquidationHoldings) {
+                                liquidationHolding['signature'] = signature
+                                liquidationHoldingsInserts.push(liquidationHolding)
+                            }
+    
+                            for (let socializedLoss of socializedLosses) {
+                                socializedLoss['signature'] = signature
+                                socializedLossInserts.push(socializedLoss)
+                            }
+    
+                        }
+                    }
+
+                    instructionNum++;
+                }
+
+                processStates.push({signature: signature, process_state: 'processed'});
+            }
+        } catch(e) {
+            processStates.push({signature: signature, process_state: 'processing error'});
         }
-        instructionNum++;
+        counter++;
     }
 
-    // All deposits and withdraws in a mango transaction should be inserted in a single SQL transaction
-    if (depositWithdrawInserts.length > 0) insertDepositWithdraws(depositWithdrawInserts, signature);
-
+    return [processStates, transactionSummaries, depositWithdrawInserts, liquidationInserts, liquidationHoldingsInserts, socializedLossInserts]
 }
 
-function processTransaction(confirmedTransaction) {
-    let signature = this.signature;
-    let account = this.account;
+function parseOracleTransactions(transactions) {
+    let processStates: any[] = [];
+    let transactionSummaries: any[] = [];
+    let oracleTransactions: any[] = [];
+    for (let transaction of transactions) {
+        let [signature, confirmedTransaction] = transaction;
+        try {
+            let transactionSummary = parseTransactionSummary(confirmedTransaction)
+            transactionSummary['signature'] = signature
+            transactionSummaries.push(transactionSummary)
 
+            if (confirmedTransaction.meta.err !== null) {
+                processStates.push({signature: signature, process_state: 'transaction error'});
+            } else {    
+                let oracleTransaction = parseOracleData(confirmedTransaction)
+                oracleTransaction['signature'] = signature
+                oracleTransactions.push(oracleTransaction)
+    
+                processStates.push({signature: signature, process_state: 'processed'});
+            }
+        } catch(e) {
+            processStates.push({signature: signature, process_state: 'processing error'});
+        }
+    }
+
+    return [processStates, transactionSummaries, oracleTransactions]
+}
+
+async function getUnprocessedSignatures(pool, account) {
+    const client = await pool.connect();
+    let signatures;
     try {
-        updateTransactionSummary(confirmedTransaction, signature);
+        const res = await client.query("select signature from transactions where process_state = 'unprocessed' and account = $1 order by id asc", [account])
+        signatures = res.rows.map(e => e['signature'])
+      } finally {
+        client.release()
+    }   
 
-        // if transaction has an error - exit processing
-        if (confirmedTransaction.meta.err !== null) {
-            db.prepare("update transactions set process_state = 'transaction error' where signature = ?").run(signature);    
-        } else {
-            if (account === oracleProgramId) {
-                processOracleTransaction(confirmedTransaction, signature);
-            } else if (account == mangoProgramId){
-                processMangoTransaction(confirmedTransaction, signature);
-            }
-    
-            db.prepare("update transactions set process_state = 'processed' where signature = ?").run(signature);
-        }
-
-    } catch(e) {
-        db.prepare("update transactions set process_state = 'processing error' where signature = ?").run(signature);
-        console.log('error with signature: ' + signature);
-    }
-    
+    return signatures;
 }
 
-function createVaultSymbolMap(cluster) {
-    // Create a mapping from vault pk to token symbol for each mango group
-    let ids = IDS;
-    let map = {};
-    for (let mangoGroupName in ids[cluster].mango_groups) {
-        let mangoGroupObj = ids[cluster].mango_groups[mangoGroupName]
-
-        let mangoGroupPk = mangoGroupObj["mango_group_pk"]
-        map[mangoGroupPk] = {};
-
-        for (let symbol in mangoGroupObj.symbols) {
-            let mintPk = mangoGroupObj.symbols[symbol];
-            let mintIndex = mangoGroupObj.mint_pks.indexOf(mintPk);
-            let vaultPk = mangoGroupObj.vault_pks[mintIndex];
-            map[mangoGroupPk][vaultPk] = symbol;
-        }
-    }
-
-    return map
-}
-
-function createOracleSymbolMap(cluster) {
-    // Create a mapping from vault pk to token symbol for each mango group
-    let ids = IDS;
-    let map = {};
-    for (let mangoGroupName in ids[cluster].mango_groups) {
-        let mangoGroupObj = ids[cluster].mango_groups[mangoGroupName]
-
-        for (let symbol in mangoGroupObj.symbols) {
-            let mintPk = mangoGroupObj.symbols[symbol];
-            let mintIndex = mangoGroupObj.mint_pks.indexOf(mintPk);
-            // There are one less oracle than the number of tokens in the mango group
-            if (mintIndex < mangoGroupObj.mint_pks.length - 1) {
-                let oraclePk = mangoGroupObj.oracle_pks[mintIndex];
-                map[oraclePk] = symbol;
-            }
-        }
-    }
-
-    return map
-}
-
-function CreateMangoGroupSymbolMap(cluster) {
-    // Create a mapping from mango pk to array of token symbols
-    let ids = IDS;
-
-    let map = {};
-    for (let mangoGroupName in ids[cluster].mango_groups) {
-        let mangoGroupObj = ids[cluster].mango_groups[mangoGroupName]
-
-        let mangoGroupPk = mangoGroupObj["mango_group_pk"]
-        map[mangoGroupPk] = [];
-
-        for (let mintPk of mangoGroupObj.mint_pks) {
-            for (let symbol of Object.keys(mangoGroupObj.symbols)) {
-                if (mangoGroupObj.symbols[symbol] === mintPk) {
-                    map[mangoGroupPk].push(symbol);
+function parseTransactionSummary(confirmedTransaction) {
+    let maxCompute = 0;
+    for (let logMessage of confirmedTransaction.meta!.logMessages!) {
+        
+        if (logMessage.endsWith('compute units')) {
+            let re = new RegExp(/(\d+)\sof/);
+            let matches = re.exec(logMessage);
+            if (matches) {
+                let compute = parseInt(matches[1]);
+                if (compute > maxCompute) {
+                    maxCompute = compute;
                 }
             }
         }
-
     }
+    let logMessages = confirmedTransaction.meta!.logMessages!.join('\n');
 
-    return map
+    return {log_messages: logMessages, compute: maxCompute} 
 }
 
-function CreateSymbolMintDecimalsMap (cluster) {
-    let ids = IDS;
+async function insertMangoTransactions(pool, processStates, transactionSummaries, depositWithdrawInserts, liquidationInserts, liquidationHoldingsInserts, socializedLossInserts) {
 
-    let map = {};
-    for (let mangoGroupName in ids[cluster].mango_groups) {
-        let mangoGroupObj = ids[cluster].mango_groups[mangoGroupName]
-        
-        let mangoGroupPk = mangoGroupObj["mango_group_pk"]
-        map[mangoGroupPk] = {};
-        for (let symbol of Object.keys(mangoGroupObj.symbols)) {
-            // TODO: can I assume this is always true?
-            map[mangoGroupPk][symbol] = symbol === "SOL" ? 9 : 6
-            // TODO: remove (testing)
-            // map[mangoGroupPk][symbol] = symbol === "USDT" ? 6 : 9
-        }
+    const processStateCs = new pgp.helpers.ColumnSet(['?signature', 'process_state'], {table: 'transactions'});
+    const transactionSummaryCs  = new pgp.helpers.ColumnSet(['?signature', 'log_messages', 'compute'], {table: 'transactions'});
+
+    const depositWithdrawCs  = new pgp.helpers.ColumnSet(['signature', 'mango_group', 'instruction_num', 'slot', 'owner', 'side', 'quantity', 'symbol', 'margin_account'], {table: 'deposit_withdraw'});
+
+    const liquidationsCs = new pgp.helpers.ColumnSet(
+        ['signature', 'mango_group', 'liqor', 'liqee', 'coll_ratio', 'in_token_symbol', 'in_token_amount', 'in_token_price', 'in_token_usd', 'out_token_symbol', 'out_token_amount', 
+        'out_token_price', 'out_token_usd', 'liquidation_fee_usd', 'socialized_losses'],
+        {table: 'liquidations'});
+    const liquidationHoldingsCs = new pgp.helpers.ColumnSet(
+        ['signature', 'symbol', 'start_assets', 'start_liabs', 'end_assets', 'end_liabs', 'price'],
+        {table: 'liquidation_holdings'});
+    const socializedLossesCs = new pgp.helpers.ColumnSet(
+        ['signature', 'symbol', 'symbol_price', 'loss', 'total_deposits', 'loss_percentage', 'loss_usd', 'total_deposits_usd'],
+        {table: 'socialized_losses'});
+
     
-    }
+    let batchSize = 1000;
+    let client = await pool.connect()
+    try {
+        await client.query('BEGIN')
 
-    return map
+        for (let i = 0, j = processStates.length; i < j; i += batchSize) {
+            let updatesBatch = processStates.slice(i, i + batchSize);
+            let updatedSql = pgp.helpers.update(updatesBatch, processStateCs) + ' WHERE v.signature = t.signature';
+            await client.query(updatedSql)
+        }
+
+        for (let i = 0, j = transactionSummaries.length; i < j; i += batchSize) {
+            let updatesBatch = transactionSummaries.slice(i, i + batchSize);
+            let updatedSql = pgp.helpers.update(updatesBatch, transactionSummaryCs) + ' WHERE v.signature = t.signature';
+            await client.query(updatedSql)
+        }
+
+        for (let i = 0, j = depositWithdrawInserts.length; i < j; i += batchSize) {
+            let insertsBatch = depositWithdrawInserts.slice(i, i + batchSize);
+            let insertsSql = pgp.helpers.insert(insertsBatch, depositWithdrawCs);
+            await client.query(insertsSql)
+        }
+
+        for (let i = 0, j = liquidationInserts.length; i < j; i += batchSize) {
+            let insertsBatch = liquidationInserts.slice(i, i + batchSize);
+            let insertsSql = pgp.helpers.insert(insertsBatch, liquidationsCs);
+            await client.query(insertsSql)
+        }
+
+        for (let i = 0, j = liquidationHoldingsInserts.length; i < j; i += batchSize) {
+            let insertsBatch = liquidationHoldingsInserts.slice(i, i + batchSize);
+            let insertsSql = pgp.helpers.insert(insertsBatch, liquidationHoldingsCs);
+            await client.query(insertsSql)
+        }
+
+        for (let i = 0, j = socializedLossInserts.length; i < j; i += batchSize) {
+            let insertsBatch = socializedLossInserts.slice(i, i + batchSize);
+            let insertsSql = pgp.helpers.insert(insertsBatch, socializedLossesCs);
+            await client.query(insertsSql)
+        }
+
+        await client.query('COMMIT')
+    } catch (e) {
+        await client.query('ROLLBACK')
+        throw e
+    } finally {
+        client.release()
+    }
 }
 
+async function insertOracleTransactions(pool, processStates, transactionSummaries, oracleTransactions) {
+    // Oracle transactions are quite frequent - so update in batches here for performance
+    
+    const processStartCs = new pgp.helpers.ColumnSet(['?signature', 'process_state'], {table: 'transactions'});
+    const transactionSummaryCs  = new pgp.helpers.ColumnSet(['?signature', 'log_messages', 'compute'], {table: 'transactions'});
+    const oracleCs = new pgp.helpers.ColumnSet(['signature', 'slot', 'oracle_pk', 'round_id', 'value', 'symbol', 'submit_value'], {table: 'oracle_transactions'});
+    
+    let batchSize = 1000;
+    let client = await pool.connect()
+    try {
+        await client.query('BEGIN')
 
-async function processTransactions(connection, account) {
-    let signaturesToProcess = db.prepare("select signature from transactions where process_state = 'unprocessed' and account = ? order by id asc").all(account).map(e => e['signature']);
+        for (let i = 0, j = processStates.length; i < j; i += batchSize) {
+            let updatesBatch = processStates.slice(i, i + batchSize);
+            let updatedSql = pgp.helpers.update(updatesBatch, processStartCs) + ' WHERE v.signature = t.signature';
+            await client.query(updatedSql)
+        }
 
+        for (let i = 0, j = transactionSummaries.length; i < j; i += batchSize) {
+            let updatesBatch = transactionSummaries.slice(i, i + batchSize);
+            let updatedSql = pgp.helpers.update(updatesBatch, transactionSummaryCs) + ' WHERE v.signature = t.signature';
+            await client.query(updatedSql)
+        }
+
+        for (let i = 0, j = oracleTransactions.length; i < j; i += batchSize) {
+            let insertsBatch = oracleTransactions.slice(i, i + batchSize);
+            let insertsSql = pgp.helpers.insert(insertsBatch, oracleCs);
+            await client.query(insertsSql)
+        }
+
+        await client.query('COMMIT')
+    } catch (e) {
+        await client.query('ROLLBACK')
+        throw e
+    } finally {
+        client.release()
+    }
+}
+
+async function getNewAddressTransactions(connection, address, requestWaitTime, pool) {
+
+    let signaturesToProcess = (await getUnprocessedSignatures(pool, address))
+     
     let promises: Promise<void>[] = [];
+    let transactions: any[] = [];
     let counter = 1;
     for (let signature of signaturesToProcess) {
-        let promise = connection.getConfirmedTransaction(signature).then(processTransaction.bind({signature: signature, account: account}));
-        console.log('processed ', counter, ' of ', signaturesToProcess.length);
+        let promise = connection.getConfirmedTransaction(signature).then(confirmedTransaction => transactions.push([signature, confirmedTransaction]));
+        console.log('requested ', counter, ' of ', signaturesToProcess.length);
         counter++;
         
         promises.push(promise);
 
-        // Limit request frequency to avoid request failures due to rate limiting    
+        // Limit request frequency to avoid request failures due to rate limiting
         await sleep(requestWaitTime);
     }
-
     await (Promise as any).allSettled(promises);
+
+    return transactions
+
 }
 
+async function processOracleTransactions(connection, address, pool, requestWaitTime) {
+
+    let transactions = await getNewAddressTransactions(connection, address, requestWaitTime, pool)
+
+    let [processStates, transactionSummaries, oracleTransactions] = parseOracleTransactions(transactions)
+    
+    await insertOracleTransactions(pool, processStates, transactionSummaries, oracleTransactions)
+
+}
+
+async function processMangoTransactions(connection, address, pool, requestWaitTime) {
+
+    let transactions = await getNewAddressTransactions(connection, address, requestWaitTime, pool)
+
+    let [processStates, transactionSummaries, depositWithdrawInserts, liquidationInserts, liquidationHoldingsInserts, socializedLossInserts] = parseMangoTransactions(transactions)
+
+    await insertMangoTransactions(pool, processStates, transactionSummaries, depositWithdrawInserts, liquidationInserts, liquidationHoldingsInserts, socializedLossInserts)
+
+}
+
+
 async function main() {
-
-    const dbInitPath = 'src/init.sql';
-
-    // Init db if it doesn't exist
-    let dbPath = path.join(__dirname, '..', 'logs.db');
-    try {
-        fs.accessSync(dbPath);
-        db = new Database(dbPath);    
-    } catch {
-        const migration = fs.readFileSync(dbInitPath, 'utf8');
-        db = new Database(dbPath);
-        db.exec(migration);
-        console.log('Database initialised');
-    }
-    db.pragma('journal_mode = WAL');
-
-    const cluster = 'mainnet-beta';
-    const clusterUrl = "https://api.mainnet-beta.solana.com";
-    // const clusterUrl = "https://solana-api.projectserum.com";
-    // const clusterUrl = "https://devnet.solana.com";
+    const cluster = process.env.CLUSTER || 'mainnet-beta';
+    const clusterUrl = process.env.CLUSTER_URL || "https://api.mainnet-beta.solana.com";
+    const requestWaitTime = parseInt(process.env.REQUEST_WAIT_TIME!) || 500;
+    const connectionString = process.env.CONNECTION_STRING
+    const oracleProgramId = process.env.ORACLE_PROGRAM_ID || 'FjJ5mhdRWeuaaremiHjeQextaAw1sKWDqr3D7pXjgztv';
+    const mangoProgramId = process.env.MANGO_PROGRAM_ID || '5fNfvyp5czQVX77yoACa3JJVEhdRaWjPuazuWgjhTqEH'
+    
     const connection = new Connection(clusterUrl, 'finalized');
-
+    const pool = new Pool(
+        {
+        connectionString: connectionString,
+        ssl: {
+            rejectUnauthorized: false,
+        }
+        }
+    )
 
     // TODO: This is the program owner - for all oracles I think - does it make more sense to use this rather than the individual oracles?
     // Check with max that this won't change - it's not in ids.json so can't get it dynamically
     const oracleProgramPk = new PublicKey(oracleProgramId);
     const mangoProgramPk = new PublicKey(mangoProgramId);
     
-
-    // TODO: Does this have to be a global variable?
-    vaultSymbolMap = createVaultSymbolMap(cluster);
-    oracleSymbolMap = createOracleSymbolMap(cluster);
-    mangoGroupSymbolMap = CreateMangoGroupSymbolMap(cluster);
-    symbolMintDecimalsMap = CreateSymbolMintDecimalsMap(cluster);
+    reverseIds = await createReverseIdsMap(cluster, new MangoClient(), connection);
 
     // Order of inserting transactions important - inserting deposit_withdraw relies on having all oracle prices available
     // So get new signatures of oracle transactions after mango transactions and insert oracle transactions first
-    await insertNewSignatures(mangoProgramPk, connection);
-    await insertNewSignatures(oracleProgramPk, connection);
-    await processTransactions(connection, oracleProgramId);
-    await processTransactions(connection, mangoProgramId);
-
-    // let signature = '2rcXkuHh2GD3Lisr8BDieyEu3xAK49x1EoMzxFh2jB6mR3zhZfNELaeeEgiUhhApyjxcJcpU63rEcMiHKsoMmDcE'
-    // let signature = '3SU5y2dYT5LRHa9cSNG9voScDEAn8hZ16XQSNpQVjrk1zMuwQVhLbMS2WgQaEqCoRhoZ7Q4skZoDXWZyPz1nRZ43'
-    // let confirmedTransaction = await connection.getConfirmedTransaction(signature);
-    // processTransaction.bind({signature: signature, account: mangoProgramId})(confirmedTransaction);
+    await insertNewSignatures(mangoProgramPk, connection, pool, requestWaitTime);
+    await insertNewSignatures(oracleProgramPk, connection, pool, requestWaitTime);
+    await processOracleTransactions(connection, oracleProgramId, pool, requestWaitTime);
+    await processMangoTransactions(connection, mangoProgramId, pool, requestWaitTime);
 
     console.log('done')
 }
